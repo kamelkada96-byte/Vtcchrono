@@ -1,0 +1,3 @@
+<resources>
+    <string name="service_desc">Lit le texte affiché par Uber Driver quand tu touches la bulle, pour afficher la durée et les km du client et de la course. Rien n’est envoyé sur internet.</string>
+</resources>
