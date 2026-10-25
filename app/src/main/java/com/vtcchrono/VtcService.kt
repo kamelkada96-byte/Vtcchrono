@@ -14,21 +14,29 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
+import kotlin.concurrent.thread
 import kotlin.math.abs
 
 class VtcService : AccessibilityService() {
     private val UBER = "com.ubercab.driver"
+    private val TRAFIC = 1.25
+    private val VITESSE = 28.0
     private lateinit var wm: WindowManager
     private var bubble: TextView? = null
     private var card: TextView? = null
+    private var gen = 0
     private val h = Handler(Looper.getMainLooper())
     private val hide = Runnable { hideCard() }
 
-    private val rx = Regex("""(?:(\d+)\s*h(?:eures?|r)?\s*)?(\d+)\s*min[^\d]{0,8}(\d+(?:[.,]\d+)?)\s*km""", RegexOption.IGNORE_CASE)
-    private val fareRx = Regex("""(\d+(?:[.,]\d{1,2})?)\s*€|€\s*(\d+(?:[.,]\d{1,2})?)""")
-    private val rideKw = Regex("""trajet|trip|course|ride|voyage""")
-    private val pickKw = Regex("""away|pickup|prise|client|de vous""")
+    private val pickRx = Regex("""(\d+)\s*min\s*\(?\s*(\d+(?:[.,]\d+)?)\s*km""", RegexOption.IGNORE_CASE)
+    private val rideRx = Regex("""(?:course|trajet|trip)\s*(?:de|of)?\s*(\d+(?:[.,]\d+)?)\s*km""", RegexOption.IGNORE_CASE)
+    private val fareRx = Regex("""(\d+(?:[.,]\d{1,2})?)\s*€""")
 
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
     override fun onInterrupt() {}
@@ -78,56 +86,90 @@ class VtcService : AccessibilityService() {
         bubble = b
     }
 
-    private fun collect(n: AccessibilityNodeInfo?, out: MutableList<String>) {
+    private fun collect(n: AccessibilityNodeInfo?, out: MutableSet<String>) {
         if (n == null) return
-        n.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out += it }
+        n.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+        n.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
         for (i in 0 until n.childCount) collect(n.getChild(i), out)
     }
 
     private fun screenTexts(): List<String>? {
-        val root = rootInActiveWindow?.takeIf { it.packageName == UBER }
-            ?: windows.mapNotNull { it.root }.firstOrNull { it.packageName == UBER }
-            ?: return null
-        val out = mutableListOf<String>()
-        collect(root, out)
-        return out
+        val roots = mutableListOf<AccessibilityNodeInfo>()
+        rootInActiveWindow?.let { roots.add(it) }
+        for (w in windows) w.root?.let { roots.add(it) }
+        val uber = roots.filter { it.packageName == UBER }
+        if (uber.isEmpty()) return null
+        val out = LinkedHashSet<String>()
+        uber.forEach { collect(it, out) }
+        return out.toList()
     }
 
-    private fun fmt(m: Int, k: Double) = "$m min · " + String.format(Locale.FRANCE, "%.1f", k) + " km"
+    private fun num(s: String) = s.replace(',', '.').toDouble()
+    private fun km(k: Double) = String.format(Locale.FRANCE, "%.1f", k)
+
+    private fun render(pm: Int, pk: Double, rk: Double, rideMin: Int, exact: Boolean, fare: Double?): String {
+        val sb = StringBuilder()
+        val pre = if (exact) "" else "≈ "
+        if (pm > 0) sb.append("🚗 Client : $pm min · ${km(pk)} km\n")
+        if (rk > 0) sb.append("➡️ Course : $pre$rideMin min · ${km(rk)} km\n")
+        if (pm > 0 && rk > 0) sb.append("Σ Total : $pre${pm + rideMin} min · ${km(pk + rk)} km\n")
+        val mins = pm + rideMin
+        if (fare != null && rk > 0 && mins > 0) {
+            sb.append("💶 ").append(String.format(Locale.FRANCE, "%.0f €/h · %.2f €/km", fare / (mins / 60.0), fare / (pk + rk)))
+        }
+        if (!exact && rk > 0) sb.append("\n⏳ calcul précis…")
+        return sb.toString().trimEnd()
+    }
 
     private fun analyze() {
         val t = screenTexts()
         if (t == null) { showCard("Ouvre Uber Driver, puis touche la bulle."); return }
-        val joined = t.joinToString(" | ")
-        var tc: Pair<Int, Double>? = null
-        var rd: Pair<Int, Double>? = null
-        val rest = mutableListOf<Pair<Int, Double>>()
-        for (m in rx.findAll(joined)) {
-            val min = (m.groupValues[1].toIntOrNull() ?: 0) * 60 + m.groupValues[2].toInt()
-            val km = m.groupValues[3].replace(',', '.').toDouble()
-            val v = Pair(min, km)
-            val ctx = joined.substring(maxOf(0, m.range.first - 25), m.range.first).lowercase()
-            when {
-                rideKw.containsMatchIn(ctx) && rd == null -> rd = v
-                pickKw.containsMatchIn(ctx) && tc == null -> tc = v
-                else -> rest.add(v)
+        var pm = 0; var pk = 0.0; var rk = 0.0; var a1 = ""; var a2 = ""
+        var gotP = false; var gotR = false
+        t.forEachIndexed { i, s ->
+            if (!gotP) pickRx.find(s)?.let { pm = it.groupValues[1].toInt(); pk = num(it.groupValues[2]); gotP = true; a1 = t.getOrElse(i + 1) { "" } }
+            if (!gotR) rideRx.find(s)?.let { rk = num(it.groupValues[1]); gotR = true; a2 = t.getOrElse(i + 1) { "" } }
+        }
+        if (!gotP && !gotR) {
+            showCard("Rien trouvé (${t.size} lignes lues).\nAppui long sur la bulle = copier le texte de l’écran.")
+            return
+        }
+        val fare = fareRx.find(t.joinToString(" "))?.let { num(it.groupValues[1]) }
+        val est = Math.round(rk / VITESSE * 60).toInt()
+        val g = ++gen
+        showCard(render(pm, pk, rk, est, false, fare))
+        if (rk > 0 && a1.isNotBlank() && a2.isNotBlank()) {
+            thread {
+                try {
+                    val p1 = geo(a1)
+                    Thread.sleep(1100)
+                    val p2 = geo(a2)
+                    val m = Math.round(route(p1, p2) * TRAFIC / 60).toInt()
+                    h.post { if (g == gen) showCard(render(pm, pk, rk, m, true, fare)) }
+                } catch (e: Exception) { }
             }
         }
-        for (v in rest) { if (tc == null) tc = v else if (rd == null) rd = v }
-        val a = tc; val b = rd
-        val sb = StringBuilder()
-        if (a != null) sb.append("🚗 Client : ").append(fmt(a.first, a.second)).append('\n')
-        if (b != null) sb.append("➡️ Course : ").append(fmt(b.first, b.second)).append('\n')
-        if (a != null && b != null) sb.append("Σ Total : ").append(fmt(a.first + b.first, a.second + b.second)).append('\n')
-        val fm = fareRx.find(joined)
-        val fare = fm?.let { r -> r.groupValues[1].ifEmpty { r.groupValues[2] }.replace(',', '.').toDoubleOrNull() }
-        if (fare != null && b != null) {
-            val mins = (a?.first ?: 0) + b.first
-            val kms = (a?.second ?: 0.0) + b.second
-            if (mins > 0 && kms > 0) sb.append("💶 ").append(String.format(Locale.FRANCE, "≈ %.0f €/h · %.2f €/km", fare / (mins / 60.0), fare / kms))
-        }
-        if (sb.isEmpty()) sb.append("Rien trouvé sur cet écran.\nAppui long sur la bulle = copier le texte de l’écran.")
-        showCard(sb.toString().trimEnd())
+    }
+
+    private fun http(u: String): String {
+        val c = URL(u).openConnection() as HttpURLConnection
+        c.setRequestProperty("User-Agent", "VTCChrono/1.0 (appli personnelle)")
+        c.connectTimeout = 8000; c.readTimeout = 8000
+        return c.inputStream.bufferedReader().readText()
+    }
+
+    private fun geo(q: String): DoubleArray {
+        val j = JSONArray(http("https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + URLEncoder.encode(q, "UTF-8")))
+        if (j.length() == 0) throw Exception("Adresse introuvable")
+        val o = j.getJSONObject(0)
+        return doubleArrayOf(o.getString("lat").toDouble(), o.getString("lon").toDouble())
+    }
+
+    private fun route(a: DoubleArray, b: DoubleArray): Double {
+        val u = String.format(Locale.US, "https://router.project-osrm.org/route/v1/driving/%f,%f;%f,%f?overview=false", a[1], a[0], b[1], b[0])
+        val r = JSONObject(http(u)).getJSONArray("routes")
+        if (r.length() == 0) throw Exception("Aucun itinéraire")
+        return r.getJSONObject(0).getDouble("duration")
     }
 
     private fun dump() {
